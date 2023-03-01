@@ -4,38 +4,24 @@
 using namespace std;
 
 __global__ void kernel(int *d_matrixA, int *d_matrixB, int *d_matrixC, int *d_matrixD, int *d_matrixE, int p, int q, int r){
-	extern __shared__ int A1[];	// p * q
-	extern __shared__ int C1[];	// p * q
-	extern __shared__ int D1[];	// q * r
+	extern __shared__ int Z[];  // A_T, C_T, D_T
 
 	int i = threadIdx.x + blockIdx.x * blockDim.x;	// i = 0, 1, 2, ..., p-1 ..
 	int j = threadIdx.y + blockIdx.y * blockDim.y;	// j = 0, 1, 2, ..., r-1 ..
 
 	//Make A1, C1, D1 shared memory be the transpose of A, C, D
-	for(int k=0; k<q; k=k+r)
-	{
-		int j1 = j+k;
-		if(j1<q)
-		{
-			A1[j1*p+i] = d_matrixA[i*q+j1];
-			C1[j1*p+i] = d_matrixC[i*q+j1];
-		}
-	}
-	for(int k=0; k<q; k=k+p)
-	{
-		int i1 = i+k;
-		if(i1<q)
-		{
-			D1[i1*r+j] = d_matrixD[j*q+i1];
-		}
-	}
+	
 
 	__syncthreads();
 
 	int sum = 0;
-	for(int k=0; k<q; k++)
+	if(i<p && j<r)
 	{
-		sum = sum + A1[k*p+i] * d_matrixB[k*r+j] + C1[k*p+i] * D1[i*r+j];
+		for(int k=0; k<q; k++)
+		{
+			//A1[k*p+i] * d_matrixB[k*r+j] + C1[k*p+i] * D1[k*r+j];	A[i][k] * B[k][j] + C[i][k] * D[j][k] = A1[k][i] * B[k][j] + C1[k][i] * D1[k][j]
+			sum = sum + d_matrixA[i*q+k] * d_matrixB[k*r+j] + d_matrixC[i*q+k] * d_matrixD[j*q+k];		
+		}
 	}
 	d_matrixE[i*r+j] = sum;
 }
@@ -65,11 +51,12 @@ void computE(int p, int q, int r, int *h_matrixA, int *h_matrixB,
 	/* Configure and launch kernels */
 	// Memory coallescing and shared memory optimization
 
-	int cp = ceil(float(p)/32);
+	int cp = p;
 	int cr = ceil(float(r)/32);
 	dim3 grid(cp,cr);
-	dim3 block(32,32);
-	kernel<<<grid,block>>>(d_matrixA, d_matrixB, d_matrixC, d_matrixD, d_matrixE, p, q, r);
+	int siz = 1024*8;
+	// for i,j in E we need A[i][_] B[_][j] C[i][_] D[j][_] //3*q ints in shared memory
+	kernel<<<grid,32,siz*sizeof(int)>>>(d_matrixA, d_matrixB, d_matrixC, d_matrixD, d_matrixE, p, q, r);
  
 	/* ****************************************************************** */
 
