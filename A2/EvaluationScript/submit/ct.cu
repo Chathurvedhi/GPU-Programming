@@ -3,27 +3,49 @@
 #include<cuda.h>
 using namespace std;
 
-__global__ void kernel(int *d_matrixA, int *d_matrixB, int *d_matrixC, int *d_matrixD, int *d_matrixE, int p, int q, int r){
-	extern __shared__ int Z[];  // A_T, C_T, D_T
-
-	int i = threadIdx.x + blockIdx.x * blockDim.x;	// i = 0, 1, 2, ..., p-1 ..
-	int j = threadIdx.y + blockIdx.y * blockDim.y;	// j = 0, 1, 2, ..., r-1 ..
-
-	//Make A1, C1, D1 shared memory be the transpose of A, C, D
-	
-
-	__syncthreads();
-
+__global__ void kernel_mul(int* matrixA, int* matrixB, int* matrixC, int* matrixD, int* matrixE, int p, int q, int r)
+{
+	int tidx = threadIdx.x / 32;
+	int tidy = threadIdx.x % 32;
+	int x = tidx + blockIdx.x * 32;
+	int y = tidy + blockIdx.y * 32;
 	int sum = 0;
-	if(i<p && j<r)
+	if(x < p && y < r)
 	{
-		for(int k=0; k<q; k++)
+		for(int i = 0; i < q; i++)
 		{
-			//A1[k*p+i] * d_matrixB[k*r+j] + C1[k*p+i] * D1[k*r+j];	A[i][k] * B[k][j] + C[i][k] * D[j][k] = A1[k][i] * B[k][j] + C1[k][i] * D1[k][j]
-			sum = sum + d_matrixA[i*q+k] * d_matrixB[k*r+j] + d_matrixC[i*q+k] * d_matrixD[j*q+k];		
+			sum += matrixA[x*q + i] * matrixB[i*r + y];	
+			sum += matrixC[x*q + i] * matrixD[i*r + y];
+			//A warp of 32 threads compute from E[x][y] to E[x][y+31]
+			//Thus the warp-threads access the same row x in matrixA and matrixC
+			//But we obtain coalesced global memory access as the warp-threads access column y - y+31 which have the values in contiguous memory locations 
+			//for a given i in the for loop we access B[i][y]-B[i][y+31] and D[i][y]-D[i][y+31] which are in contiguous memory locations
 		}
+		matrixE[x*r + y] = sum;
 	}
-	d_matrixE[i*r+j] = sum;
+}
+
+__global__ void kernel_transpose(int* matrix_T,int* matrix, int r, int q)
+{
+	__shared__ int tile[32][32];
+	int tidx = threadIdx.x / 32;
+	int tidy = threadIdx.x % 32;
+	int x = tidx + blockIdx.x * 32;	// 0 - r+
+	int y = tidy + blockIdx.y * 32; // 0 - q+
+	int id = x*q + y;
+	int x_t = tidx + blockIdx.y * 32;	// 0 - q+
+	int y_t = tidy + blockIdx.x * 32;	// 0 - r+
+	int id_t = x_t*r + y_t;
+	if(x < r && y < q)
+	{
+		tile[tidx][tidy] = matrix[id];		//Coalesced global memory access as warp-threads access along the same row of size 32
+	}
+	__syncthreads();
+	if(x_t < q && y_t < r)
+	{
+		matrix_T[id_t] = tile[tidy][tidx];	//Coalesced global memory access as warp-threads access along the same row of size 32
+	}
+	
 }
 
 
@@ -51,13 +73,26 @@ void computE(int p, int q, int r, int *h_matrixA, int *h_matrixB,
 	/* Configure and launch kernels */
 	// Memory coallescing and shared memory optimization
 
-	int cp = p;
-	int cr = ceil(float(r)/32);
-	dim3 grid(cp,cr);
-	int siz = 1024*8;
-	// for i,j in E we need A[i][_] B[_][j] C[i][_] D[j][_] //3*q ints in shared memory
-	kernel<<<grid,32,siz*sizeof(int)>>>(d_matrixA, d_matrixB, d_matrixC, d_matrixD, d_matrixE, p, q, r);
- 
+	int p_t = (p+31)/32;
+	int q_t = (q+31)/32;
+	int r_t = (r+31)/32;
+
+	int* d_matrixDt;
+	cudaMalloc(&d_matrixDt, r * q * sizeof(int));
+
+	dim3 dimGrid(r_t, q_t, 1);
+	dim3 dimBlock(32*32);
+
+	kernel_transpose<<<dimGrid, dimBlock>>>(d_matrixDt, d_matrixD, r, q); 	//d_matrixDt is the transpose of d_matrixD
+	
+	cudaDeviceSynchronize();
+
+	dim3 dimGrid1(p_t, r_t, 1);
+
+	kernel_mul<<<dimGrid1, dimBlock>>>(d_matrixA, d_matrixB, d_matrixC, d_matrixDt, d_matrixE, p, q, r);	//d_matrixE = d_matrixA * d_matrixB + d_matrixC * d_matrixDt
+
+	cudaDeviceSynchronize();
+
 	/* ****************************************************************** */
 
 	// copy the result back...
